@@ -105,6 +105,9 @@ EXIT_MAX_ERR_PX       = 130
 DUCK_DETECTION_ON    = True
 DUCK_TRIGGER_FRAMES  = 2
 DUCK_TRIGGER_AREA    = 2500
+DUCK_MIN_AREA        = 2000     # smaller than this is noise
+DUCK_MAX_AREA        = 160000   # a duck right in front of the camera fills a lot of frame
+DUCK_LARGE_AREA      = 40000    # above this the blob is close and may be cropped by the frame
 DUCK_MIN_BOTTOM_FRAC = 0.50
 DUCK_PATH_TOL_PX     = 140
 DUCK_LINE_REJECT_PX  = 40
@@ -146,8 +149,16 @@ MERGE_BLIND_OMEGA      = -1.10
 MERGE_MIN_S            = 0.45
 MERGE_MAX_S            = 4.5     # safety net only
 
+# rotation budget: like MANEUVER_MIN_ROT for turns, but an upper bound.
+# Without this a blind phase can spin for its whole timeout (~260 deg).
+OVERTAKE_MAX_ROT_CROSS = 1.50    # rad, ~86 deg
+OVERTAKE_MAX_ROT_MERGE = 1.50    # rad, ~86 deg
+
 # how much of the overtake time counts as real forward progress towards the goal
 OVERTAKE_PROGRESS_FRAC = 0.60
+
+# Operator safety
+MANUAL_CMD_TIMEOUT_S = 0.6    # manual keys are hold-to-drive; stop if no key event arrives
 
 # HSV Thresholds
 HSV_YELLOW = (np.array([10,  70,  70]), np.array([40, 255, 255]))
@@ -398,6 +409,7 @@ STATE_DUCK_PASS = "duck_overtake_pass"
 STATE_DUCK_MERGE = "duck_overtake_merge"
 STATE_INTERSECTION_TURN = "intersection_maneuver"
 STATE_GOAL_REACHED = "goal_reached"
+STATE_ESTOP = "emergency_stop"
 
 OVERTAKE_STATES = (STATE_DUCK_CROSS, STATE_DUCK_PASS, STATE_DUCK_MERGE)
 
@@ -414,6 +426,11 @@ active_turn_direction = 'none'
 keyboard_engaged = False
 manual_v = 0.0
 manual_omega = 0.0
+_manual_cmd_time = 0.0
+
+# Latched emergency stop. Set by SPACE, cleared only by G. Checked before
+# anything else in the frame handler, so no state can drive through it.
+ESTOP = False
 
 _omega_hist = collections.deque(maxlen=SMOOTH_FRAMES)
 _last_good_omega = 0.0
@@ -438,8 +455,10 @@ _cross_seen_right = False   # yellow line has been observed right of centre
 _pass_clear_frames = 0
 _pass_clear_time = 0.0
 _overtake_count = 0
+_overtake_failed = 0
 _overtake_note = "idle"
 _duck_cooldown_until = 0.0
+_overtake_rot = 0.0         # integrated rotation inside the current overtake phase
 
 
 def _init_half_widths():
@@ -457,7 +476,9 @@ _half_width_init = list(_half_width)
 TEL = {"state": current_state, "v": 0.0, "omega": 0.0, "rows": 0,
        "yellow": False, "white": False, "duck": False, "duck_area": 0,
        "fps": 0.0, "link": "ok", "note": "", "overtake": "idle",
-       "overtake_count": 0, "overtake_on": OVERTAKE_ENABLED}
+       "overtake_count": 0, "overtake_failed": 0, "overtake_on": OVERTAKE_ENABLED,
+       "estop": False, "stopline_ahead": False, "auto_path_mode": False,
+       "setup_complete": False, "path_progress": "no route"}
 
 # ==============================================================================
 # ROS LINK
@@ -515,17 +536,27 @@ signal.signal(signal.SIGINT, lambda s, f: release_override() or os._exit(0))
 
 
 def watchdog_loop():
+    """Never let this thread die: it is the only thing that stops the wheels when
+    frame processing stalls or throws."""
     global link_stale
     while True:
-        time.sleep(0.1)
-        if simulation_mode:
-            continue
-        stale = (time.time() - _last_frame_time) > FRAME_STALE_S
-        if stale and not link_stale:
-            print("No camera frames - stopping wheels.")
-        if stale:
-            publish_drive(0.0, 0.0)
-        link_stale = stale
+        try:
+            time.sleep(0.1)
+            if simulation_mode:
+                continue
+            if ESTOP:
+                publish_drive(0.0, 0.0)
+            # _last_frame_time is stamped only after a frame is FULLY processed,
+            # so an exception mid-frame also looks stale here and stops the robot.
+            stale = (time.time() - _last_frame_time) > FRAME_STALE_S
+            if stale and not link_stale:
+                print("No camera frames (or frame processing failed) - stopping wheels.")
+            if stale:
+                publish_drive(0.0, 0.0)
+            link_stale = stale
+        except Exception as e:
+            print(f"watchdog error (continuing): {e}")
+            time.sleep(0.1)
 
 
 threading.Thread(target=watchdog_loop, daemon=True).start()
@@ -616,7 +647,10 @@ def scan_band_left_lane(yellow, white, w, y0, y1, cx):
     return ycx, wcx
 
 
-def sample_lane_center(frame, yellow, white, w, h, cx, draw=False):
+def sample_lane_center(frame, yellow, white, w, h, cx, draw=False, adapt=True):
+    """adapt=False for any state where the robot is NOT squarely inside the right
+    lane (turning, merging back). Learning the lane width from mis-paired lines
+    there corrupts the calibration for every later frame."""
     targets = []
     n = len(SAMPLE_ROW_FRACS)
     for i, frac in enumerate(SAMPLE_ROW_FRACS):
@@ -628,8 +662,11 @@ def sample_lane_center(frame, yellow, white, w, h, cx, draw=False):
             t = (ycx + wcx) // 2
             measured = (wcx - ycx) / 2.0
             lo, hi = 0.45 * _half_width_init[i], 2.0 * _half_width_init[i]
-            if lo <= measured <= hi:
-                _half_width[i] = (1 - HALF_WIDTH_ADAPT) * hw + HALF_WIDTH_ADAPT * measured
+            if adapt and lo <= measured <= hi:
+                updated = (1 - HALF_WIDTH_ADAPT) * hw + HALF_WIDTH_ADAPT * measured
+                # never let the running estimate drift far from calibration
+                _half_width[i] = max(0.6 * _half_width_init[i],
+                                     min(1.6 * _half_width_init[i], updated))
         elif ycx is not None:
             t = int(ycx + hw)
         elif wcx is not None:
@@ -699,11 +736,17 @@ def valid_lane_reacquired(lane_center, yellow_cx, white_cx, cx):
 
 def is_duck(contour):
     area = cv2.contourArea(contour)
-    if area < 2000 or area > 50000:
+    if area < DUCK_MIN_AREA or area > DUCK_MAX_AREA:
         return False
     x, y, w, h = cv2.boundingRect(contour)
     aspect_ratio = float(w) / h if h > 0 else 0
-    if aspect_ratio > 1.9 or aspect_ratio < 0.4:
+    # A duck close enough to stop for is often clipped by the frame edge, so its
+    # bounding box is no longer duck-shaped. Loosen the aspect gate for big blobs;
+    # the line-rejection rules below still throw out lane markings.
+    if area >= DUCK_LARGE_AREA:
+        if aspect_ratio > 2.4 or aspect_ratio < 0.3:
+            return False
+    elif aspect_ratio > 1.9 or aspect_ratio < 0.4:
         return False
     hull_area = cv2.contourArea(cv2.convexHull(contour))
     if hull_area == 0:
@@ -770,10 +813,13 @@ def _credit_goal_timer(seconds):
         post_intersection_start_time += seconds
 
 
-def _finish_duck_episode(now, overtook):
-    """Return to lane following and repay the goal timer for time lost."""
+def _finish_duck_episode(now, overtook, failed=False):
+    """Return to lane following and repay the goal timer for time lost.
+    failed=True means the manoeuvre was abandoned, not completed - it is still
+    credited and cooled down (so it does not immediately retry), but it is
+    counted and reported as a failure rather than a success."""
     global current_state, _lane_lost_frames, _duck_seen_frames, _duck_clear_frames
-    global _overtake_note, _duck_cooldown_until
+    global _overtake_note, _duck_cooldown_until, _overtake_failed
     if overtook:
         waited = max(0.0, _overtake_clock - _duck_stop_clock)
         manoeuvre = max(0.0, now - _overtake_clock)
@@ -782,20 +828,24 @@ def _finish_duck_episode(now, overtook):
         _duck_cooldown_until = now + DUCK_RETRIGGER_COOL
     else:
         _credit_goal_timer(max(0.0, now - _duck_stop_clock))
+    if failed:
+        _overtake_failed += 1
     _omega_hist.clear()
     _lane_lost_frames = 0
     _duck_seen_frames = 0
     _duck_clear_frames = 0
-    _overtake_note = "idle"
+    _overtake_note = "aborted" if failed else "idle"
     current_state = STATE_LANE_FOLLOWING
 
 
 def start_overtake(now):
     global current_state, state_start_time, _overtake_clock, _cross_seen_right
     global _pass_clear_frames, _pass_clear_time, _overtake_count, _overtake_note
+    global _overtake_rot
     current_state = STATE_DUCK_CROSS
     state_start_time = now
     _overtake_clock = now
+    _overtake_rot = 0.0
     _cross_seen_right = False
     _pass_clear_frames = 0
     _pass_clear_time = 0.0
@@ -819,7 +869,7 @@ def process_image_frame(frame):
     global current_tracked_tile_index
     global _duck_ref_x, _duck_ref_area, _duck_stop_clock, _overtake_clock
     global _cross_seen_right, _pass_clear_frames, _pass_clear_time, _overtake_note
-    global _duck_cooldown_until
+    global _duck_cooldown_until, _overtake_rot, manual_v, manual_omega
 
     if frame is None or frame.size == 0:
         return
@@ -827,7 +877,9 @@ def process_image_frame(frame):
     now = time.time()
     dt = min(0.5, max(0.0, now - _prev_frame_t))
     _prev_frame_t = now
-    _last_frame_time = now
+    # NOTE: _last_frame_time is stamped at the END of this function, not here.
+    # If anything below throws, the watchdog must see a stale frame and stop the
+    # wheels rather than believing the control loop is alive.
     if dt > 0:
         _fps = 0.85 * _fps + 0.15 * (1.0 / dt)
 
@@ -931,7 +983,17 @@ def process_image_frame(frame):
     # ==========================================================================
     # STATE MACHINE
     # ==========================================================================
-    if current_state == STATE_GOAL_REACHED:
+    if ESTOP:
+        # Latched. Nothing below can drive through it; only the G key clears it.
+        publish_drive(0.0, 0.0)
+        manual_v = manual_omega = 0.0
+        arrow_v, arrow_omega = 0.0, 0.0
+        note = "EMERGENCY STOP - press G to release"
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+        cv2.putText(frame, "EMERGENCY STOP", (14, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+    elif current_state == STATE_GOAL_REACHED:
         publish_drive(0.0, 0.0)
         arrow_v, arrow_omega = 0.0, 0.0
         note = "GOAL REACHED - STOPPED"
@@ -946,10 +1008,15 @@ def process_image_frame(frame):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
     elif keyboard_engaged:
+        # Hold-to-drive. The browser sends a release on key-up; if that packet is
+        # lost, or the tab loses focus, this timeout stops the robot anyway.
+        if now - _manual_cmd_time > MANUAL_CMD_TIMEOUT_S:
+            manual_v = manual_omega = 0.0
         publish_drive(manual_v, manual_omega)
         arrow_v, arrow_omega = manual_v, manual_omega
-        current_state = STATE_LANE_FOLLOWING
-        note = "Manual override"
+        # Deliberately does NOT overwrite current_state: clobbering it here used to
+        # destroy an in-progress turn or overtake. The state is reset on release.
+        note = "Manual override" if (manual_v or manual_omega) else "Manual override - idle"
         cv2.putText(frame, "MANUAL OVERRIDE", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
@@ -1105,20 +1172,30 @@ def process_image_frame(frame):
         crossed = (yellow_any_cx is not None and yellow_any_cx >= target_px)
         # if we saw it swing right and then lose it, we are already across
         lost_after_right = (_cross_seen_right and yellow_any_cx is None)
+        rot_spent = abs(_overtake_rot)
+        cv2.putText(frame, f"cross rot {rot_spent:.2f}/{OVERTAKE_MAX_ROT_CROSS:.2f} rad",
+                    (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
         if (crossed or lost_after_right) and t_in >= CROSS_MIN_S:
             current_state = STATE_DUCK_PASS
             state_start_time = now
             _pass_clear_frames = 0
             _pass_clear_time = 0.0
+            _overtake_rot = 0.0
             _omega_hist.clear()
             print("Overtake: in the left lane -> passing the duck.")
-        elif t_in > CROSS_MAX_S:
+        elif rot_spent >= OVERTAKE_MAX_ROT_CROSS or t_in > CROSS_MAX_S:
+            # Rotation budget spent (or the timer ran out) without the vision ever
+            # confirming the crossing. Stop turning and go straight to the pass
+            # phase, which is closed-loop and can recover.
+            why = "rotation budget" if rot_spent >= OVERTAKE_MAX_ROT_CROSS else "timeout"
             current_state = STATE_DUCK_PASS
             state_start_time = now
             _pass_clear_frames = 0
             _pass_clear_time = 0.0
+            _overtake_rot = 0.0
             _omega_hist.clear()
-            print("Overtake: cross timed out -> passing anyway.")
+            print(f"Overtake: cross hit {why} after {rot_spent:.2f} rad -> passing anyway.")
 
     # ------------------------------------------------------------------
     # OVERTAKE PHASE 2 - lane-follow inside the left lane until past the duck
@@ -1152,6 +1229,7 @@ def process_image_frame(frame):
         if (past_duck and t_in >= PASS_MIN_S) or t_in > PASS_MAX_S:
             current_state = STATE_DUCK_MERGE
             state_start_time = now
+            _overtake_rot = 0.0
             _omega_hist.clear()
             print("Overtake: duck is behind us -> merging back into the right lane.")
 
@@ -1163,8 +1241,10 @@ def process_image_frame(frame):
         target_px = int(w * MERGE_TARGET_FRAC)
         cv2.line(frame, (target_px, int(h * 0.5)), (target_px, h), (255, 0, 255), 2)
 
+        # adapt=False: the robot is straddling lanes here, so the line pair is not
+        # a valid measurement of lane width.
         lane_center, rows_hit = sample_lane_center(frame, yellow_lane, white_mask,
-                                                   w, h, cx, draw=True)
+                                                   w, h, cx, draw=True, adapt=False)
 
         if yellow_any_cx is not None:
             err = yellow_any_cx - target_px           # positive -> yellow still too far right
@@ -1179,13 +1259,24 @@ def process_image_frame(frame):
         arrow_v, arrow_omega = OVERTAKE_SPEED, omega
         _overtake_note = "phase 3/3 merge"
 
+        rot_spent = abs(_overtake_rot)
+        cv2.putText(frame, f"merge rot {rot_spent:.2f}/{OVERTAKE_MAX_ROT_MERGE:.2f} rad",
+                    (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
         back_home = valid_lane_reacquired(lane_center, yellow_cx, white_cx, cx)
         if back_home and t_in >= MERGE_MIN_S:
             print("Overtake complete - right lane re-acquired.")
             _finish_duck_episode(now, overtook=True)
-        elif t_in > MERGE_MAX_S:
-            print("Overtake: merge timed out - handing back to lane follower.")
-            _finish_duck_episode(now, overtook=True)
+        elif rot_spent >= OVERTAKE_MAX_ROT_MERGE or t_in > MERGE_MAX_S:
+            # This is a FAILED manoeuvre, not a completed one - say so, count it,
+            # and hand a stopped robot back to the lane follower rather than
+            # continuing to rotate.
+            why = "rotation budget" if rot_spent >= OVERTAKE_MAX_ROT_MERGE else "timeout"
+            publish_drive(0.0, 0.0)
+            arrow_v, arrow_omega = 0.0, 0.0
+            print(f"Overtake ABORTED: merge hit {why} after {rot_spent:.2f} rad "
+                  f"without re-acquiring the right lane.")
+            _finish_duck_episode(now, overtook=True, failed=True)
 
     elif current_state == STATE_RED_STOP:
         publish_drive(0.0, 0.0)
@@ -1197,6 +1288,9 @@ def process_image_frame(frame):
 
         # 2.0s hold duration check
         if elapsed_in_stop >= RED_STOP_DURATION:
+            # standing still is not progress towards the goal tile
+            _credit_goal_timer(RED_STOP_DURATION)
+
             if AUTO_PATH_MODE and path_intersections_passed < len(ROUTE_INTERSECTION_ORDER):
                 tile = ROUTE_INTERSECTION_ORDER[path_intersections_passed]
                 direction = ROUTE_TURN_TILES.get(tile, 'straight')
@@ -1204,15 +1298,26 @@ def process_image_frame(frame):
                 last_red_line_time = now
                 start_intersection_turn(direction)
             elif AUTO_PATH_MODE:
-                # Arrived / Route complete
-                current_state = STATE_GOAL_REACHED
-                publish_drive(0.0, 0.0)
+                # No planned turn left. That does NOT automatically mean we have
+                # arrived: a route with no intersections at all, or a stop line on
+                # the final leg, both land here. Only stop if the goal clock says so.
+                still_to_drive = (post_intersections_tracking and
+                                  (now - post_intersection_start_time) < goal_total_duration)
+                if still_to_drive:
+                    rem = goal_total_duration - (now - post_intersection_start_time)
+                    print(f"Stop line with no planned turn -> straight on ({rem:.1f}s to goal).")
+                    last_red_line_time = now
+                    start_intersection_turn('straight')
+                else:
+                    current_state = STATE_GOAL_REACHED
+                    publish_drive(0.0, 0.0)
             else:
                 note = "Waiting for W / A / D key"
 
     elif current_state == STATE_INTERSECTION_TURN:
+        # adapt=False: mid-turn the yellow/white pair is not the lane the robot is in.
         exit_center, rows_hit = sample_lane_center(frame, yellow_lane, white_mask,
-                                                   w, h, cx, draw=True)
+                                                   w, h, cx, draw=True, adapt=False)
         valid_exit = valid_lane_reacquired(exit_center, yellow_cx, white_cx, cx)
         time_in_turn = now - state_start_time
         min_s = MANEUVER_MIN_S.get(active_turn_direction, 0.8)
@@ -1271,6 +1376,8 @@ def process_image_frame(frame):
 
     if current_state == STATE_INTERSECTION_TURN:
         _turn_rot += arrow_omega * dt
+    elif current_state in (STATE_DUCK_CROSS, STATE_DUCK_MERGE):
+        _overtake_rot += arrow_omega * dt
 
     # HUD banner for the overtake
     if current_state in OVERTAKE_STATES:
@@ -1296,8 +1403,10 @@ def process_image_frame(frame):
                 "note": note, "stopline_ahead": red_line_ahead,
                 "auto_path_mode": AUTO_PATH_MODE,
                 "setup_complete": SETUP_COMPLETE,
+                "estop": ESTOP,
                 "overtake": _overtake_note,
                 "overtake_count": _overtake_count,
+                "overtake_failed": _overtake_failed,
                 "overtake_on": OVERTAKE_ENABLED,
                 "path_progress": f"{path_intersections_passed}/{len(ROUTE_INTERSECTION_ORDER)}"
                                   if ROUTE_INTERSECTION_ORDER else "no route"})
@@ -1319,6 +1428,11 @@ def process_image_frame(frame):
         with lock:
             latest_mask_jpeg = mjpeg.tobytes()
 
+    # Stamped LAST, on purpose. Reaching this line is the proof that a whole frame
+    # was processed and a drive command was issued; anything that throws above
+    # leaves this stale and the watchdog stops the wheels within FRAME_STALE_S.
+    _last_frame_time = now
+
 
 # ==============================================================================
 # SIMULATION FEED / ROS CAMERA SUBSCRIPTION
@@ -1333,7 +1447,11 @@ def simulation_hardware_loop():
         cv2.line(frame, (490, 480), (390, 260), (255, 255, 255), 3)
         if current_state == STATE_RED_STOP:
             cv2.rectangle(frame, (200, 400), (470, 430), (0, 0, 255), -1)
-        process_image_frame(frame)
+        try:
+            process_image_frame(frame)
+        except Exception as e:
+            publish_drive(0.0, 0.0)
+            print(f"frame processing error (wheels stopped): {e}")
         time.sleep(0.033)
 
 
@@ -1348,7 +1466,10 @@ else:
             buf = np.frombuffer(base64.b64decode(msg['data']), np.uint8)
             process_image_frame(cv2.imdecode(buf, cv2.IMREAD_COLOR))
         except Exception as e:
-            print(f"frame decode error: {e}")
+            # Never leave the last command latched on the wheels because of a
+            # decode error or a bug in the state machine.
+            publish_drive(0.0, 0.0)
+            print(f"frame error (wheels stopped): {e}")
 
     camera_sub.subscribe(_on_frame)
 
@@ -1458,14 +1579,17 @@ PAGE = """
           <tr><td class="k">Overtake</td><td class="v" id="t_ot_on">-</td></tr>
           <tr><td class="k">Phase</td><td class="v" id="t_ot_phase">-</td></tr>
           <tr><td class="k">Completed</td><td class="v" id="t_ot_count">-</td></tr>
+          <tr><td class="k">Aborted</td><td class="v" id="t_ot_failed">-</td></tr>
         </table>
         <div style="margin-top:6px; color:#8a8a8a;">Stop &rarr; wait 2s &rarr; cross yellow &rarr; pass in left lane &rarr; merge back.</div>
       </div>
 
       <div class="card">
         <strong>Controls</strong>
-        <kbd>E</kbd> Manual Override &nbsp; <kbd>Space</kbd> Stop &nbsp; <kbd>Q</kbd> Quit<br>
-        <kbd>W/A/S/D</kbd> Drive manually or turn at red lines.<br>
+        <span style="color:#ff6b6b; font-weight:700;"><kbd>Space</kbd> EMERGENCY STOP (latched)</span>
+        &nbsp; <kbd>G</kbd> Release<br>
+        <kbd>E</kbd> Manual Override &nbsp; <kbd>Q</kbd> Quit<br>
+        <kbd>W/A/S/D</kbd> Hold to drive, or tap at a red line to pick the turn.<br>
         <kbd>Y</kbd> Toggle AUTO_PATH_MODE &nbsp; <kbd>O</kbd> Toggle overtaking<br>
         <kbd>R</kbd> Reset run state
       </div>
@@ -1498,10 +1622,14 @@ PAGE = """
       otOn.className = 'v ' + (t.overtake_on ? 'ok' : 'bad');
       document.getElementById('t_ot_phase').innerText = t.overtake;
       document.getElementById('t_ot_count').innerText = t.overtake_count;
+      var otf = document.getElementById('t_ot_failed');
+      otf.innerText = t.overtake_failed;
+      otf.className = 'v ' + (t.overtake_failed ? 'bad' : 'ok');
 
       var box = document.getElementById('status_box');
       box.innerText = t.note ? (t.state + ' - ' + t.note) : t.state;
-      if (t.state === 'goal_reached') { box.style.background = '#22c55e'; box.style.color = '#000'; }
+      if (t.estop) { box.style.background = '#c0342e'; box.style.color = '#fff'; box.innerText = 'EMERGENCY STOP - press G to release'; }
+      else if (t.state === 'goal_reached') { box.style.background = '#22c55e'; box.style.color = '#000'; }
       else if (t.state === 'red_line_stopped') { box.style.background = '#c0342e'; box.style.color = '#fff'; }
       else if (t.state === 'duck_stopped') { box.style.background = '#e67e22'; box.style.color = '#fff'; }
       else if (t.state.indexOf('duck_overtake') === 0) { box.style.background = '#a855f7'; box.style.color = '#fff'; }
@@ -1598,13 +1726,34 @@ PAGE = """
     });
   }
 
+  var driveKeys = ['w','a','s','d'];
+  var heldKeys = {};
+
   document.addEventListener('keydown', function(e) {
     var k = e.key.toLowerCase();
     if (e.key === ' ') k = 'space';
-    if (['w','a','s','d','e','q','r','y','o','space'].indexOf(k) >= 0) {
+    if (['w','a','s','d','e','q','r','y','o','g','space'].indexOf(k) >= 0) {
       if (k === 'space') e.preventDefault();
+      if (driveKeys.indexOf(k) >= 0) {
+        if (heldKeys[k]) return;   // ignore auto-repeat
+        heldKeys[k] = true;
+      }
       fetch('/control?key=' + k);
     }
+  });
+
+  // Hold-to-drive: releasing the key stops the robot.
+  document.addEventListener('keyup', function(e) {
+    var k = e.key.toLowerCase();
+    if (driveKeys.indexOf(k) >= 0 && heldKeys[k]) {
+      delete heldKeys[k];
+      if (Object.keys(heldKeys).length === 0) fetch('/control?key=release');
+    }
+  });
+
+  // Losing focus counts as letting go of every key.
+  window.addEventListener('blur', function() {
+    if (Object.keys(heldKeys).length) { heldKeys = {}; fetch('/control?key=release'); }
   });
 </script>
 </body>
@@ -1710,18 +1859,27 @@ def confirm_manual():
 @app.route('/confirm_auto_path')
 def confirm_auto_path():
     global AUTO_PATH_MODE, SETUP_COMPLETE
+    global post_intersections_tracking, post_intersection_start_time
     if len(ROUTE) < 2:
         return jsonify({"ok": False, "error": "compute a route first"})
     AUTO_PATH_MODE = True
     SETUP_COMPLETE = True
-    print(f"A* mode confirmed. Route: {ROUTE}")
+    if not ROUTE_INTERSECTION_ORDER:
+        # Nothing to count on this route, so the goal clock has to start now
+        # rather than after a final turn that never happens.
+        post_intersections_tracking = True
+        post_intersection_start_time = time.time()
+        print(f"A* mode confirmed. No intersections on route - "
+              f"dead-reckoning {goal_total_duration:.2f}s to the goal tile.")
+    else:
+        print(f"A* mode confirmed. Route: {ROUTE}")
     return jsonify({"ok": True})
 
 
 @app.route('/control')
 def control():
     global keyboard_engaged, manual_v, manual_omega, AUTO_PATH_MODE, OVERTAKE_ENABLED
-    global current_state, state_start_time, last_red_line_time
+    global current_state, state_start_time, last_red_line_time, ESTOP, _manual_cmd_time
     global path_intersections_passed, post_intersections_tracking, current_tracked_tile_index
     global _omega_hist, _lane_lost_frames, _duck_seen_frames, _duck_clear_frames, _overtake_note
 
@@ -1729,20 +1887,54 @@ def control():
     now = time.time()
 
     if key == 'q':
+        ESTOP = True
         release_override()
         threading.Timer(0.2, lambda: os._exit(0)).start()
         return jsonify({"ok": True, "action": "quit"})
+
+    # ---- latched emergency stop -------------------------------------------
+    if key == 'space':
+        ESTOP = True
+        manual_v = manual_omega = 0.0
+        publish_drive(0.0, 0.0)
+        print("EMERGENCY STOP engaged (press G to release).")
+        return jsonify({"ok": True, "estop": True})
+
+    if key == 'g':
+        was = ESTOP
+        ESTOP = False
+        manual_v = manual_omega = 0.0
+        _omega_hist.clear()
+        _lane_lost_frames = 0
+        last_red_line_time = now      # do not re-trigger on the line we stopped at
+        if was:
+            print("Emergency stop released.")
+        return jsonify({"ok": True, "estop": False})
+
+    if ESTOP and key != 'r':
+        return jsonify({"ok": False, "error": "emergency stop engaged - press G first"})
 
     if key == 'e':
         keyboard_engaged = not keyboard_engaged
         manual_v = manual_omega = 0.0
         publish_drive(0.0, 0.0)
+        if not keyboard_engaged:
+            # leaving manual: hand back a clean slate instead of a half-finished
+            # turn or overtake
+            current_state = STATE_LANE_FOLLOWING
+            state_start_time = now
+            last_red_line_time = now
+            _omega_hist.clear()
+            _lane_lost_frames = 0
+            _overtake_note = "idle"
         return jsonify({"ok": True, "manual": keyboard_engaged})
 
-    if key == 'space':
+    if key == 'release':
+        # key-up for W/A/S/D: hold-to-drive
         manual_v = manual_omega = 0.0
+        _manual_cmd_time = now
         publish_drive(0.0, 0.0)
-        return jsonify({"ok": True, "action": "stop"})
+        return jsonify({"ok": True, "action": "release"})
 
     if key == 'y':
         AUTO_PATH_MODE = not AUTO_PATH_MODE
@@ -1753,6 +1945,9 @@ def control():
         return jsonify({"ok": True, "overtake_enabled": OVERTAKE_ENABLED})
 
     if key == 'r':
+        ESTOP = False
+        keyboard_engaged = False
+        manual_v = manual_omega = 0.0
         current_state = STATE_LANE_FOLLOWING
         state_start_time = now
         last_red_line_time = 0.0
@@ -1775,6 +1970,7 @@ def control():
             return jsonify({"ok": True, "turn": direction})
 
         keyboard_engaged = True
+        _manual_cmd_time = now
         if key == 'w':
             manual_v, manual_omega = LANE_SPEED, 0.0
         elif key == 's':
