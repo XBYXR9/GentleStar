@@ -1,10 +1,9 @@
 docs_config_version: v1
-
 # CONFIGURE THESE TO MATCH YOUR PROJECT:
-project: "REPOSITORY_NAME_HERE"
+project: "gentlestar-duckietown"
 copyright: "Duckietown"
-author: "YOUR_NAME_HERE"
-version: "ente"
+author: "Team GentleStar"
+version: "1.0"
 custom_sections:  [
   "Configuration",
   "Subscribers",
@@ -21,7 +20,6 @@ custom_sections:  [
   "outputs",
   "output"
 ]
-
 # REFRAIN FROM CHANGING THESE SPHINX-SPECIFIC CONFIGURATION SETTINGS:
 autodoc_default_flags:
   members: True
@@ -29,9 +27,7 @@ autodoc_default_flags:
   undoc-members: True
   inherited-members: True
   show-inheritance: True
-
 add_module_names: False
-
 # settings for napoleon
 napoleon_google_docstring: True
 napoleon_numpy_docstring: False
@@ -45,7 +41,6 @@ napoleon_use_ivar: False
 napoleon_use_param: False
 napoleon_use_rtype: True
 napoleon_use_keyword: True
-
 # options for the sphinx_rtd_theme
 html_theme_options:
   prev_next_buttons_location: 'bottom'
@@ -55,4 +50,3 @@ html_theme_options:
   navigation_depth: 4
   includehidden: False
   titles_only: False
-
