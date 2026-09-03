@@ -13,15 +13,13 @@ Modules
 ``navigate.py``
     Main entry point. Runs the state machine: lane following (OpenCV yellow
     and white line detection), duck detection and avoidance, red stop line
-    detection, and A* planned intersection turns. Serves a live camera
-    stream with detection overlays at ``http://localhost:5000``.
-
-``a_star_planner.py``
-    A* path planner used to compute the turn at the intersection on the
-    TUM track.
+    detection, and A* planned intersection turns. Includes a built-in
+    weighted A* search (``astar_search``) over the TUM track's tile graph.
+    Serves a live camera stream with detection overlays at
+    ``http://localhost:5000``.
 
 ``tum_map.yaml``
-    Map of the TUM lab track as a 7x6 tile grid, used by the planner.
+    Map of the TUM lab track as a 7x6 tile grid, used by ``astar_search``.
 
 ``keyboard_drive.py``
     Manual keyboard teleop for the robot (forward/back/turn/stop), used for
