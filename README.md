@@ -63,8 +63,7 @@ python3 packages/navigation/src/keyboard_drive.py
 ## Files
 | File | Description |
 |------|-------------|
-| `packages/navigation/src/navigate.py` | Main script: lane following, duck detection, intersection navigation |
-| `packages/navigation/src/a_star_planner.py` | A* path planner for the TUM track |
+| `packages/navigation/src/navigate.py` | Main script: lane following, duck detection, intersection navigation, built-in A* planner |
 | `packages/navigation/src/tum_map.yaml` | TUM lab track map (7x6 tile grid) |
 | `packages/navigation/src/keyboard_drive.py` | Manual keyboard control |
 
