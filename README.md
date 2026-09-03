@@ -1,4 +1,4 @@
-# Duckietown Autonomous Navigation — TUM
+# Duckietown Autonomous Navigation - TUM
 
 Autonomous navigation system for Duckietown built by Yahia Taha, Ahmad Kaihan Saba, and Dorde Vidakovic at TUM.
 
@@ -76,7 +76,7 @@ python3 packages/navigation/src/keyboard_drive.py
 
 ## Architecture
 Everything runs on the laptop via roslibpy connecting to duck3's rosbridge websocket (port 9001).
-No custom code is deployed to the robot — only standard Duckietown Docker containers run on duck3.
+No custom code is deployed to the robot - only standard Duckietown Docker containers run on duck3.
 
 ## System Overview
 Laptop (WSL)                    duck3 robot
