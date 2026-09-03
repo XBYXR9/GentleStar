@@ -9,6 +9,8 @@ Autonomous navigation system for Duckietown built by Yahia Taha, Ahmad Kaihan Sa
 - A* path planning for intersection navigation
 - Live camera stream with detection overlays at http://localhost:5000
 
+![Duck detection stopping the robot](assets/Detection%20overlay.png)
+
 ## Requirements
 - Python 3.9+
 - duck3 robot running with rosbridge on port 9001
