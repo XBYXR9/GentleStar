@@ -5,7 +5,7 @@ Autonomous navigation system for Duckietown built by Yahia Taha, Ahmad Kaihan Sa
 ## What it does
 - Lane following using OpenCV (yellow + white line detection)
 - Duck detection and avoidance (stop or go-around maneuver)
-- Red stop line detection (stops 2 seconds with cooldown)
+- Red stop line detection (stops 3 seconds with cooldown)
 - A* path planning for intersection navigation
 - Live camera stream with detection overlays at http://localhost:5000
 
@@ -37,7 +37,7 @@ Note: Replace `192.168.137.233` with duck3's current IP from Windows Mobile Hots
 
 ### 1. Start the robot containers
 ```bash
-ssh duckie@duck3.local
+ssh duckie@duck3.local   # password: quackquack
 docker start duckiebot-interface
 docker start rosbridge-websocket
 ```
@@ -99,23 +99,15 @@ websocket               car-interface
 │ wheels
 
 ## State Machine
-- lane_following → normal driving using lane detection
-- duck_stopped → stopped because duck is blocking path
-- duck_overtake → executing maneuver around duck
-- red_line_stopped → stopped at red stop line for 2 seconds
-- intersection_maneuver → executing A* planned intersection turn
-- u_turn → rotating in place until camera geometry confirms the opposite lane
-- goal_reached → destination reached and wheels stopped
+- LANE_FOLLOWING → normal driving using lane detection
+- DUCK_STOP → stopped because duck is blocking path
+- GO_AROUND → executing maneuver around duck
+- RED_STOP → stopped at red stop line for 3 seconds
+- INTERSECTION → executing A* planned turn
 
-## Intersection Penalty
-The live A* planner is `astar_search()` inside `packages/navigation/src/navigate.py`.
-Its runtime intersection penalty defaults to 1000.0 and can be toggled to 0.0
-from the dashboard for plain shortest-path routing.
-
-Intersections cost more than ordinary tiles because each one means a red-line
-stop plus an intersection maneuver. The Manhattan heuristic intentionally ignores
-those penalties; because every move still costs at least one tile, the heuristic
-stays admissible and A* remains optimal for the weighted route cost.
+We also built a standalone U-turn maneuver during development, but removed
+it: the fixed start/goal route above never requires one, so it added
+complexity without serving the actual driving task.
 
 ## Limitations
 - **Lighting sensitivity**: lane and duck detection use fixed HSV thresholds, so they are tuned for the TUM lab's lighting and would need re-tuning under a different setup.
