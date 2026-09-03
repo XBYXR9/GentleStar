@@ -105,7 +105,7 @@ websocket               car-interface
 - RED_STOP → stopped at red stop line for 3 seconds
 - INTERSECTION → executing A* planned turn
 
-## Limitations & Future Work
+## Limitations
 - **Lighting sensitivity**: lane and duck detection use fixed HSV thresholds, so they are tuned for the TUM lab's lighting and would need re-tuning under a different setup.
 - **Single fixed route**: the map, start tile, and goal tile are hardcoded for the TUM track layout rather than passed in as parameters.
 - **Duck shape assumption**: the duck detector filters by contour shape and area, so it is tuned specifically for the yellow rubber duck used in testing and may miss other duck sizes/colors without retuning.
