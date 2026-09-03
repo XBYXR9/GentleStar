@@ -105,8 +105,17 @@ websocket               car-interface
 - RED_STOP → stopped at red stop line for 3 seconds
 - INTERSECTION → executing A* planned turn
 
-## PPO Reinforcement Learning (attempted)
+## Limitations & Future Work
+- **Lighting sensitivity**: lane and duck detection use fixed HSV thresholds, so they are tuned for the TUM lab's lighting and would need re-tuning under a different setup.
+- **Single fixed route**: the map, start tile, and goal tile are hardcoded for the TUM track layout rather than passed in as parameters.
+- **Duck shape assumption**: the duck detector filters by contour shape and area, so it is tuned specifically for the yellow rubber duck used in testing and may miss other duck sizes/colors without retuning.
+- **No dynamic replanning**: if the robot is blocked somewhere the A* route didn't anticipate, it has no fallback beyond the duck-avoidance state machine.
+
+### PPO Reinforcement Learning (attempted)
 We trained a PPO agent for 183M steps in simulation using stable-baselines3.
 The agent learned to follow lanes in simulation but exhibited circular motion
 on the real robot due to the sim-to-real gap. We documented this as a research
 finding and switched to the classical OpenCV approach.
+
+## License
+See [LICENSE.pdf](LICENSE.pdf).
