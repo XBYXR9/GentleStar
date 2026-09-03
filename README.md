@@ -1,6 +1,6 @@
 # Duckietown Autonomous Navigation — TUM
 
-Autonomous navigation system for Duckietown built by Yahia Taha and Dorde Vidakovic at TUM.
+Autonomous navigation system for Duckietown built by Yahia Taha, Ahmad Kaihan Saba, and Dorde Vidakovic at TUM.
 
 ## What it does
 - Lane following using OpenCV (yellow + white line detection)
