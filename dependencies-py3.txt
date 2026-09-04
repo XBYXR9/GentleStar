@@ -3,4 +3,5 @@
 roslibpy
 opencv-python
 flask
+numpy
 pyyaml
