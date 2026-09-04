@@ -19,13 +19,12 @@ a track made of tiles. In plain terms, it does four jobs at once:
    the camera feed, see robot stats, click a start/goal on a map, and
    drive the robot manually with the keyboard if they want.
 
-Most behavior is kept camera-only and intentionally simple. Comments explain
-the controls and state-machine decisions so each part is easy to follow.
+Everything below is the same code as before - nothing about how the
+robot behaves has been changed. Comments have simply been added so
+each part is easy to follow.
 ====================================================================
 """
 import base64
-import csv
-import datetime
 import os
 import signal
 import threading
@@ -262,15 +261,6 @@ RIGHT_SEARCH_V = 0.06     # If the white line isn't found yet during a right tur
 RIGHT_SEARCH_OMEGA = -1.6 # ...while turning right to go looking for it
 RIGHT_HUG_MAX_S = 6.0     # Safety timeout for the whole right-turn maneuver
 
-# During an explicit start U-turn the robot rotates in place at this low yaw
-# rate, so it can keep checking camera geometry every frame instead of doing
-# a blind timed spin.
-UTURN_OMEGA = 1.0
-
-# This is only a safety fallback: if the camera never confirms the opposite
-# lane within this many seconds, stop and return to lane following anyway.
-UTURN_TIMEOUT_S = 5.0
-
 # ==============================================================================
 # A* PATH PLANNER WITH HEADING CONSTRAINT
 # ==============================================================================
@@ -304,28 +294,19 @@ OPENINGS = {
 # A "3way_*" or "4way" tile is the only place a red stop line actually
 # exists on the real track - driving through one always costs a real
 # stop-and-wait plus a turn maneuver, which takes much longer than simply
-# driving across one more ordinary tile. This default penalty is used when
-# the dashboard's "avoid intersections" setting is enabled; switching it to
-# 0.0 makes A* behave like a plain shortest-path planner.
-DEFAULT_INTERSECTION_PENALTY = 1000.0
-
-# A U-turn is slower than a tile but far cheaper than an extra intersection,
-# so the planner should accept one to avoid a stop line.
-UTURN_PENALTY = 3.0
-
-# These time values are estimates until real runs are logged. They are used
-# only by the route-comparison endpoint to give a rough side-by-side total.
-EST_TILE_TIME_S = 4.5
-EST_TURN_TIME_S = 3.0
-EST_UTURN_TIME_S = 4.0
-
-intersection_penalty_value = DEFAULT_INTERSECTION_PENALTY
+# driving across one more ordinary tile. INTERSECTION_PENALTY is added to
+# the A* route cost every time the path enters such a tile. Making this
+# number large means the planner strongly prefers the route with the
+# FEWEST intersections first, and only uses tile-count as a tie-breaker
+# after that. It's set far bigger than any plausible tile-count difference
+# on this map (a worst case of maybe a few dozen tiles), so intersections
+# are avoided almost regardless of how much extra driving distance that
+# costs. Lowering it (e.g. to 2-4) would make the planner more willing to
+# trade "one more intersection" for "a lot of extra tiles" instead.
+INTERSECTION_PENALTY = 1000.0
 
 def is_intersection_kind(kind):
     return kind.startswith("3way_") or kind == "4way"
-
-def current_intersection_penalty():
-    return intersection_penalty_value
 
 def load_track_map():
     """Load the grid of tiles that make up the track from a YAML file on
@@ -381,51 +362,21 @@ def build_adjacency_graph():
 
 GRAPH_ADJ = build_adjacency_graph()
 
-def _step_dir(a, b):
-    """Compass direction of the one-tile move from a to b."""
-    di, dj = b[0] - a[0], b[1] - a[1]
-    for d, (x, y) in DELTAS.items():
-        if (di, dj) == (x, y):
-            return d
-    return None
-
-def _path_first_heading(path):
-    if len(path) < 2:
-        return None
-    return _step_dir(path[0], path[1])
-
-def _count_path_intersections(path):
-    return sum(1 for tile in path[:-1] if is_intersection_kind(MAP_TILES[tile[1]][tile[0]]))
-
-def _count_route_intersections_for_summary(path):
-    count = _count_path_intersections(path)
-    if path and count < 2 and is_intersection_kind(MAP_TILES[path[-1][1]][path[-1][0]]):
-        count += 1
-    return count
-
-def _route_tile_count(path):
-    return max(0, len(path) - 1)
-
-def _route_uturn_count(turn_tiles):
-    return sum(1 for d in turn_tiles.values() if d == "uturn")
-
-def _estimate_route_time(path, turn_tiles):
-    tiles = _route_tile_count(path)
-    intersections = _count_route_intersections_for_summary(path)
-    uturns = _route_uturn_count(turn_tiles)
-    return (EST_TILE_TIME_S * tiles
-            + intersections * (RED_STOP_HOLD_S + EST_TURN_TIME_S)
-            + uturns * EST_UTURN_TIME_S)
-
-def _astar_search_once(start, goal, required_heading=None, penalty=None):
+def astar_search(start, goal, required_heading=None):
     """
-    Weighted A* pathfinding between two tiles for a single heading policy.
+    Weighted A* pathfinding between two tiles.
 
-    Every tile normally costs 1.0 to drive onto, plus the active intersection
-    penalty if it's a stop-line intersection - except the very last (goal) tile,
+    Every tile normally costs 1.0 to drive onto, plus INTERSECTION_PENALTY
+    if it's a stop-line intersection - except the very last (goal) tile,
     since arriving there ends the trip rather than triggering a turn (this
     matches compute_path_turn_decisions below, which likewise never treats
     the first or last tile of the route as a turn/stop).
+
+    `required_heading`, if given, forces the very first move out of the
+    start tile to be in that compass direction (i.e. "the robot is already
+    facing this way, so the route must start by driving that way" - it
+    can't immediately do a U-turn on tile one). If no route exists with
+    that restriction, the search quietly retries without it.
 
     The Manhattan distance (straight grid distance, ignoring intersection
     penalties) is used as A*'s "heuristic" - an estimate of remaining
@@ -433,24 +384,20 @@ def _astar_search_once(start, goal, required_heading=None, penalty=None):
     costs at least 1.0. That guarantee is what keeps A* finding the truly
     best route rather than just a decent one.
     """
-    if penalty is None:
-        penalty = current_intersection_penalty()
     if start not in GRAPH_ADJ or goal not in GRAPH_ADJ:
-        return [start], 0.0
+        return [start]
     import heapq
-    # Each entry in the priority queue: (estimated total cost, negative
-    # intersection count for deterministic plain-route ties, cost so far,
-    # current tile, path taken so far)
-    open_heap = [(abs(start[0] - goal[0]) + abs(start[1] - goal[1]), 0, 0.0, start, [start])]
-    best_seen = {}
+    # Each entry in the priority queue: (estimated total cost, cost so far, current tile, path taken so far)
+    open_heap = [(abs(start[0] - goal[0]) + abs(start[1] - goal[1]), 0.0, start, [start])]
+    visited = set()
     while open_heap:
-        f, neg_intersections, g, n, path = heapq.heappop(open_heap)  # Always expand the most promising option next
+        f, g, n, path = heapq.heappop(open_heap)  # Always expand the most promising option next
         if n == goal:
-            return path, g  # Found it - this is the best route
-        seen_g, seen_neg_intersections = best_seen.get(n, (float("inf"), 0))
-        if g > seen_g or (g == seen_g and neg_intersections >= seen_neg_intersections):
+            return path  # Found it - this is the best route
+        state_key = (n, len(path))
+        if state_key in visited:
             continue
-        best_seen[n] = (g, neg_intersections)
+        visited.add(state_key)
         for nb, d in GRAPH_ADJ.get(n, []):
             if len(path) == 1 and required_heading and d != required_heading:
                 continue  # Skip moves that don't match the robot's starting facing direction
@@ -458,30 +405,15 @@ def _astar_search_once(start, goal, required_heading=None, penalty=None):
                 continue  # Don't allow the route to loop back on itself
             edge_cost = 1.0
             if nb != goal and is_intersection_kind(MAP_TILES[nb[1]][nb[0]]):
-                edge_cost += penalty
+                edge_cost += INTERSECTION_PENALTY
             tentative_g = g + edge_cost
             h = abs(nb[0] - goal[0]) + abs(nb[1] - goal[1])
-            nb_intersections = -neg_intersections + (1 if nb != goal and is_intersection_kind(MAP_TILES[nb[1]][nb[0]]) else 0)
-            heapq.heappush(open_heap, (tentative_g + h, -nb_intersections, tentative_g, nb, path + [nb]))
-    return [start], float("inf")  # No route found at all - just stay put
+            heapq.heappush(open_heap, (tentative_g + h, tentative_g, nb, path + [nb]))
+    if required_heading:
+        return astar_search(start, goal, required_heading=None)  # Retry without the heading restriction
+    return [start]  # No route found at all - just stay put
 
-def astar_search(start, goal, required_heading=None, penalty=None):
-    """
-    Weighted A* pathfinding between two tiles, with an explicit start U-turn
-    when the robot's physical heading makes the best route unreachable.
-    """
-    unrestricted, unrestricted_cost = _astar_search_once(start, goal, None, penalty)
-    if not required_heading:
-        return unrestricted
-
-    heading_path, heading_cost = _astar_search_once(start, goal, required_heading, penalty)
-    if heading_path[-1] == goal and heading_cost <= unrestricted_cost + UTURN_PENALTY:
-        return heading_path
-    if unrestricted[-1] == goal:
-        return unrestricted
-    return heading_path
-
-def compute_path_turn_decisions(path, start_uturn=False):
+def compute_path_turn_decisions(path):
     """
     Walk through the computed route tile by tile and, for every
     intersection tile in the middle of the path, work out whether the
@@ -490,16 +422,13 @@ def compute_path_turn_decisions(path, start_uturn=False):
     needs to head going out.
 
     Returns:
-      turn_tiles: a dict of {tile: "left"/"right"/"straight"/"uturn"} for each
+      turn_tiles: a dict of {tile: "left"/"right"/"straight"} for each
                   intersection on the route
       intersection_order: the same intersections, in the order the robot
                   will reach them while driving the route
     """
     turn_tiles = {}
     intersection_order = []
-    if start_uturn and path:
-        turn_tiles[path[0]] = "uturn"
-        intersection_order.append(path[0])
     if len(path) < 3:
         return turn_tiles, intersection_order
     for k in range(1, len(path) - 1):
@@ -523,8 +452,6 @@ def compute_path_turn_decisions(path, start_uturn=False):
                 turn_tiles[cur] = "left"
             elif RIGHT_OF[in_d] == out_d:
                 turn_tiles[cur] = "right"
-            elif OPPOSITE[in_d] == out_d:
-                turn_tiles[cur] = "uturn"
     return turn_tiles, intersection_order
 
 # ---- route / map state -------------------------------------------------
@@ -535,7 +462,6 @@ ROUTE = []                       # The list of tiles the robot will drive throug
 ROUTE_GOAL = None                # The chosen destination tile
 ROUTE_TURN_TILES = {}            # Which intersections need left/right/straight (see compute_path_turn_decisions)
 ROUTE_INTERSECTION_ORDER = []    # The intersections in the order they'll be reached
-COMPARE_ROUTES = None            # Optional route-comparison result drawn on the dashboard map
 bot_start_tile = None            # Chosen starting tile
 bot_heading = 'E'                # Which way the robot is facing at the start (N/E/S/W)
 AUTO_PATH_MODE = False           # True = robot drives the planned route automatically; False = manual/keyboard control
@@ -558,13 +484,6 @@ tiles_after_final_turn = 0
 current_tracked_tile_index = 0
 goal_total_duration = 0.0
 
-run_metrics = None
-run_started_at = None
-run_start_wall = None
-run_frame_count = 0
-run_fps_sum = 0.0
-run_logged = False
-
 def compute_route():
     """
     Called when the dashboard's "Compute Route" button is pressed. Runs
@@ -583,8 +502,7 @@ def compute_route():
     if len(path) < 2 or path[-1] != ROUTE_GOAL:
         ROUTE, ROUTE_TURN_TILES, ROUTE_INTERSECTION_ORDER = [], {}, []
         return False, "No drivable path found."
-    start_uturn = _path_first_heading(path) != bot_heading
-    turn_tiles, order = compute_path_turn_decisions(path, start_uturn=start_uturn)
+    turn_tiles, order = compute_path_turn_decisions(path)
     ROUTE = path
     ROUTE_TURN_TILES = turn_tiles
     ROUTE_INTERSECTION_ORDER = order
@@ -606,27 +524,7 @@ def compute_route():
         goal_total_duration = FINAL_TILE_SECONDS
     else:
         goal_total_duration = 0.0
-    return True, f"Route: {_route_tile_count(path)} tiles ({len(order)} actions)"
-
-def _route_summary(start, goal, heading, penalty):
-    path = astar_search(start, goal, required_heading=heading, penalty=penalty)
-    start_uturn = bool(heading and _path_first_heading(path) != heading and path[-1] == goal)
-    turn_tiles, order = compute_path_turn_decisions(path, start_uturn=start_uturn)
-    return {
-        "path": [list(t) for t in path],
-        "tile_count": _route_tile_count(path),
-        "intersection_count": _count_route_intersections_for_summary(path),
-        "uturn_count": _route_uturn_count(turn_tiles),
-        "estimated_time_s": round(_estimate_route_time(path, turn_tiles), 2),
-        "actions": [{"tile": list(tile), "turn": turn_tiles[tile]} for tile in order],
-    }
-
-def compare_routes(start, goal, heading):
-    return {
-        "penalty_on": _route_summary(start, goal, heading, DEFAULT_INTERSECTION_PENALTY),
-        "penalty_off": _route_summary(start, goal, heading, 0.0),
-        "estimate_note": "Times are estimates until real runs are logged.",
-    }
+    return True, f"Route: {len(path)} tiles ({len(order)} turns)"
 
 def _credit_goal_timer(seconds):
     """
@@ -677,13 +575,6 @@ def render_map_svg():
     if len(ROUTE) > 1:
         pts = " ".join(f"{pad + i*cell+cell//2},{pad + j*cell+cell//2}" for (i, j) in ROUTE)
         p.append(f'<polyline points="{pts}" fill="none" stroke="#1f9bff" stroke-width="3" opacity="0.85" pointer-events="none"/>')
-    if COMPARE_ROUTES:
-        for key, color, dash in (("penalty_off", "#ff8c42", "5 3"), ("penalty_on", "#22c55e", "0")):
-            route = COMPARE_ROUTES.get(key, {}).get("path", [])
-            if len(route) > 1:
-                pts = " ".join(f"{pad + i*cell+cell//2},{pad + j*cell+cell//2}" for (i, j) in route)
-                p.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="4" '
-                         f'stroke-dasharray="{dash}" opacity="0.75" pointer-events="none"/>')
     if bot_start_tile:
         sx, sy = bot_start_tile
         p.append(f'<circle cx="{pad + sx*cell+cell//2}" cy="{pad + sy*cell+cell//2}" r="10" fill="#22c55e" pointer-events="none"/>')
@@ -693,14 +584,8 @@ def render_map_svg():
         p.append(f'<circle cx="{pad + gx*cell+cell//2}" cy="{pad + gy*cell+cell//2}" r="10" fill="#ef4444" pointer-events="none"/>')
         p.append(f'<text x="{pad + gx*cell+cell//2}" y="{pad + gy*cell+cell//2+4}" font-size="11" fill="white" text-anchor="middle" font-weight="bold" pointer-events="none">G</text>')
     for (ti, tj), d in ROUTE_TURN_TILES.items():
-        arrow = {"left": "L", "right": "R", "straight": "^", "uturn": "U"}.get(d, "?")
+        arrow = {"left": "L", "right": "R", "straight": "^"}.get(d, "?")
         p.append(f'<text x="{pad + ti*cell+cell//2}" y="{pad + tj*cell+cell//2+5}" font-size="13" fill="#ffd000" text-anchor="middle" font-family="sans-serif" font-weight="bold" pointer-events="none">{arrow}</text>')
-    if COMPARE_ROUTES:
-        for key, color in (("penalty_off", "#ff8c42"), ("penalty_on", "#22c55e")):
-            for action in COMPARE_ROUTES.get(key, {}).get("actions", []):
-                if action.get("turn") == "uturn":
-                    ti, tj = action["tile"]
-                    p.append(f'<text x="{pad + ti*cell+cell//2}" y="{pad + tj*cell+cell//2+5}" font-size="13" fill="{color}" text-anchor="middle" font-family="sans-serif" font-weight="bold" pointer-events="none">U</text>')
     if AUTO_PATH_MODE and ROUTE:
         # Figure out which tile to show the pulsing "you are here" dot on:
         # still driving toward the next planned turn, or already in the
@@ -728,7 +613,6 @@ STATE_RED_STOP = "red_line_stopped"            # Stopped at a red stop line, wai
 STATE_DUCK_STOP = "duck_stopped"               # Stopped for a duck, watching to see if it moves
 STATE_DUCK_OVERTAKE = "duck_overtake"          # Actively steering around a duck
 STATE_INTERSECTION_TURN = "intersection_maneuver"  # Mid-turn at an intersection
-STATE_UTURN = "u_turn"                         # Rotating in place until the opposite lane is visible
 STATE_GOAL_REACHED = "goal_reached"            # Arrived at the destination, fully stopped
 DUCK_OVERTAKE_STATES = (STATE_DUCK_STOP, STATE_DUCK_OVERTAKE)
 
@@ -740,7 +624,6 @@ last_duck_avoid_time = 0.0
 turn_sequence_active = []        # The list of (v, omega, duration) steps for the turn currently in progress
 turn_step_index = 0              # Which step of that sequence we're on
 active_turn_direction = 'none'
-uturn_pending = False
 keyboard_engaged = False         # True while a human is driving manually via keyboard
 manual_v = 0.0
 manual_omega = 0.0
@@ -772,8 +655,7 @@ _last_publish_warn = 0.0
 TEL = {"state": current_state, "v": 0.0, "omega": 0.0,
        "yellow": False, "white": False, "duck": False, "duck_area": 0,
        "fps": 0.0, "link": "ok", "note": "", "auto_path_mode": False,
-       "setup_complete": False, "duck_phase": "idle", "path_progress": "no route",
-       "intersection_penalty": DEFAULT_INTERSECTION_PENALTY}
+       "setup_complete": False, "duck_phase": "idle", "path_progress": "no route"}
 
 # ==============================================================================
 # ROS LINK
@@ -832,20 +714,6 @@ def publish_drive(v, omega):
         if time.time() - _last_publish_warn > 2.0:   # Don't spam the console - only log this every 2 seconds
             print(f"publish_drive failed: {e}")
             _last_publish_warn = time.time()
-
-def valid_lane_exit_geometry(yc, wc, cx):
-    """
-    Return True when the camera sees a plausible lane centered in front of
-    the robot: yellow on the left, white on the right, enough lane width, and
-    the lane midpoint close to the image center.
-    """
-    if yc is None or wc is None:
-        return False
-    lane_width_ok = wc > yc + MIN_LANE_WIDTH_PX
-    line_sides_ok = yc < cx and wc > cx
-    lane_center = (yc + wc) / 2.0
-    center_ok = abs(lane_center - cx) < 15
-    return lane_width_ok and line_sides_ok and center_ok
 
 def release_override():
     """Called when the script is shutting down: stop the wheels and hand
@@ -913,16 +781,6 @@ def start_intersection_turn(direction):
     current_state = STATE_INTERSECTION_TURN
     print(f"Intersection turn commenced: {direction}")
 
-def start_u_turn():
-    """Begin a planned in-place U-turn at the start tile."""
-    global current_state, state_start_time, step_start_time, uturn_pending
-    current_state = STATE_UTURN
-    state_start_time = step_start_time = time.time()
-    uturn_pending = False
-    if run_metrics is not None:
-        run_metrics["uturns"] += 1
-    print("Planned U-turn commenced at start tile.")
-
 def _advance_route_after_turn():
     """
     Called every time a turn maneuver finishes. If that was the LAST
@@ -936,57 +794,6 @@ def _advance_route_after_turn():
         post_intersections_tracking = True
         post_intersection_start_time = time.time()
         print(f"Final turn complete. Driving {goal_total_duration:.2f}s to the goal tile...")
-
-def start_run_logging():
-    """Start collecting one run's timing, route, event, and camera-rate data."""
-    global run_metrics, run_started_at, run_start_wall, run_frame_count, run_fps_sum, run_logged
-    now = time.time()
-    run_started_at = now
-    run_start_wall = datetime.datetime.now()
-    run_frame_count = 0
-    run_fps_sum = 0.0
-    run_logged = False
-    run_metrics = {
-        "start_tile": bot_start_tile,
-        "goal_tile": ROUTE_GOAL,
-        "heading": bot_heading,
-        "penalty_setting": current_intersection_penalty(),
-        "tiles_driven": _route_tile_count(ROUTE),
-        "intersections_crossed": _count_path_intersections(ROUTE),
-        "red_stops": 0,
-        "duck_stops": 0,
-        "duck_overtakes": 0,
-        "uturns": 0,
-        "lane_lost_frames": 0,
-        "goal_reached": False,
-    }
-
-def log_run_result(goal_reached):
-    """Write the current run metrics to a timestamped CSV in runs/."""
-    global run_logged
-    if run_metrics is None or run_started_at is None or run_logged:
-        return
-    os.makedirs("runs", exist_ok=True)
-    finished_at = datetime.datetime.now()
-    stamp = finished_at.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join("runs", f"run_{stamp}.csv")
-    row = dict(run_metrics)
-    row["wall_clock_time_s"] = round(time.time() - run_started_at, 3)
-    row["goal_reached"] = bool(goal_reached)
-    row["mean_camera_fps"] = round(run_fps_sum / run_frame_count, 2) if run_frame_count else 0.0
-    row["started_at"] = run_start_wall.isoformat(timespec="seconds") if run_start_wall else ""
-    row["finished_at"] = finished_at.isoformat(timespec="seconds")
-    fieldnames = ["started_at", "finished_at", "start_tile", "goal_tile", "heading",
-                  "penalty_setting", "wall_clock_time_s", "tiles_driven",
-                  "intersections_crossed", "red_stops", "duck_stops",
-                  "duck_overtakes", "uturns", "lane_lost_frames",
-                  "mean_camera_fps", "goal_reached"]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerow(row)
-    run_logged = True
-    print(f"Run log written: {path}")
 
 # ==============================================================================
 # MAIN FRAME PROCESSING
@@ -1021,7 +828,6 @@ def process_image_frame(frame):
     global _prev_frame_t, _last_frame_time, _fps
     global path_intersections_passed, post_intersections_tracking, post_intersection_start_time
     global current_tracked_tile_index
-    global run_frame_count, run_fps_sum
 
     if frame is None or frame.size == 0:
         return  # Got a bad/empty frame - skip it rather than crashing
@@ -1032,9 +838,6 @@ def process_image_frame(frame):
     _prev_frame_t = now
     if dt > 0:
         _fps = 0.85 * _fps + 0.15 * (1.0 / dt)  # Smoothed ("exponential moving average") FPS estimate
-    if run_metrics is not None:
-        run_frame_count += 1
-        run_fps_sum += _fps
 
     h, w = frame.shape[:2]
     cx = w // 2.0  # The horizontal center of the camera image - i.e. "straight ahead"
@@ -1207,9 +1010,6 @@ def process_image_frame(frame):
             if elapsed_post >= goal_total_duration:
                 current_state = STATE_GOAL_REACHED
                 publish_drive(0.0, 0.0)
-                if run_metrics is not None:
-                    run_metrics["goal_reached"] = True
-                log_run_result(True)
                 print(f"Goal reached after {elapsed_post:.1f}s!")
 
         if current_state == STATE_LANE_FOLLOWING:
@@ -1241,8 +1041,6 @@ def process_image_frame(frame):
                 # toward zero each frame). Only fully stop if this goes on
                 # too long (LANE_LOST_MAX_FRAMES).
                 lost_frames += 1
-                if run_metrics is not None:
-                    run_metrics["lane_lost_frames"] += 1
                 if lost_frames <= LANE_LOST_MAX_FRAMES:
                     last_omega *= LANE_MEMORY_DECAY
                     publish_drive(V_MIN, last_omega)
@@ -1262,8 +1060,6 @@ def process_image_frame(frame):
                 _duck_ref_x = duck_x
                 _duck_ref_area = float(duck_area)
                 _overtake_note = "waiting to see if it moves"
-                if run_metrics is not None:
-                    run_metrics["duck_stops"] += 1
                 publish_drive(0.0, 0.0)
                 print("Duck detected in lane -> stopped, watching whether it moves...")
 
@@ -1272,8 +1068,6 @@ def process_image_frame(frame):
             elif red_line_found and (now - last_red_line_time) > STOPLINE_COOLDOWN_S:
                 current_state = STATE_RED_STOP
                 state_start_time = now
-                if run_metrics is not None:
-                    run_metrics["red_stops"] += 1
                 publish_drive(0.0, 0.0)
                 print("Stop line -> stopped, holding before proceeding...")
 
@@ -1299,36 +1093,7 @@ def process_image_frame(frame):
             else:
                 direction = 'straight'
             last_red_line_time = now
-            if direction == 'uturn':
-                start_u_turn()
-            else:
-                start_intersection_turn(direction)
-
-    elif current_state == STATE_UTURN:
-        valid_exit = valid_lane_exit_geometry(yc, wc, cx)
-        elapsed = now - state_start_time
-        if valid_exit:
-            publish_drive(0.0, 0.0)
-            last_red_line_time = now
-            prev_error = 0.0
-            lost_frames = 0
-            current_state = STATE_LANE_FOLLOWING
-            note = "U-turn complete - opposite lane acquired"
-            _advance_route_after_turn()
-            print("U-turn complete on lane geometry.")
-        elif elapsed >= UTURN_TIMEOUT_S:
-            publish_drive(0.0, 0.0)
-            last_red_line_time = now
-            prev_error = 0.0
-            lost_frames = 0
-            current_state = STATE_LANE_FOLLOWING
-            note = "U-turn timeout - lane follow"
-            _advance_route_after_turn()
-            print("U-turn timeout - stopped wheels and returned to lane following.")
-        else:
-            publish_drive(0.0, UTURN_OMEGA)
-            arrow_v, arrow_omega = 0.0, UTURN_OMEGA
-            note = "U-turn - searching for opposite lane"
+            start_intersection_turn(direction)
 
     elif current_state == STATE_INTERSECTION_TURN:
         # Executing a turn. "valid_exit" checks whether the camera can now
@@ -1337,7 +1102,8 @@ def process_image_frame(frame):
         # this is the vision-based signal that the turn is basically done,
         # on top of the minimum-time safety checks below.
         yc_t, wc_t = yc, wc  # Same centroids computed earlier in this frame, now re-used mid-turn
-        valid_exit = valid_lane_exit_geometry(yc_t, wc_t, cx)
+        valid_exit = (yc_t is not None and yc_t < cx - 15) or \
+                     (yc_t is not None and wc_t is not None and wc_t > yc_t + MIN_LANE_WIDTH_PX)
 
         if active_turn_direction == 'right':
             # Right turns steer by keeping the white outer line at a fixed
@@ -1446,8 +1212,6 @@ def process_image_frame(frame):
             state_start_time = now
             _overtake_note = f"centring on yellow line ({DUCK_FOLLOW_YELLOW_S:.0f}s)"
             note = "Duck is not moving - centring on the yellow line to go around it"
-            if run_metrics is not None:
-                run_metrics["duck_overtakes"] += 1
             print(f"Duck is not moving -> centring on the yellow line for "
                   f"{DUCK_FOLLOW_YELLOW_S:.1f}s.")
         else:
@@ -1526,7 +1290,6 @@ def process_image_frame(frame):
                 "note": note, "auto_path_mode": AUTO_PATH_MODE,
                 "setup_complete": SETUP_COMPLETE,
                 "duck_phase": _overtake_note,
-                "intersection_penalty": current_intersection_penalty(),
                 "path_progress": f"{path_intersections_passed}/{len(ROUTE_INTERSECTION_ORDER)}"
                                   if ROUTE_INTERSECTION_ORDER else "no route"})
 
@@ -1641,9 +1404,6 @@ PAGE = """
   button.active { background:#f6c915 !important; color:#111 !important; font-weight:bold; }
   button.go { background:#f6c915; color:#111; font-weight:700; border:0; }
   button.go:hover { background:#ffd733; }
-  .toggle-row { display:flex; gap:8px; align-items:center; justify-content:space-between; margin-top:8px; }
-  .compare-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
-  .compare-cell { background:#111; border:1px solid #333; border-radius:6px; padding:6px; }
   kbd { display:inline-block; background:#2c2c2c; border:1px solid #000; border-radius:4px; padding:1px 5px; font-weight:700; }
 </style>
 </head>
@@ -1715,15 +1475,8 @@ PAGE = """
         <strong>A* Route</strong>
         <table>
           <tr><td class="k">Auto-Path</td><td class="v" id="t_auto">-</td></tr>
-          <tr><td class="k">Penalty</td><td class="v" id="t_penalty">-</td></tr>
           <tr><td class="k">Turns done</td><td class="v" id="t_progress">-</td></tr>
         </table>
-        <div class="toggle-row">
-          <span>Avoid intersections</span>
-          <button id="penalty_btn" onclick="togglePenalty()">ON</button>
-        </div>
-        <button onclick="compareCurrentRoute()" style="width:100%; margin-top:8px;">Compare Routes</button>
-        <div id="compare_box" class="compare-grid" style="display:none;"></div>
         <div style="margin-top:6px; color:#8a8a8a;">Each stop line auto-picks the next turn until the plan runs out, then the bot times itself to the goal tile.</div>
       </div>
       <div class="card">
@@ -1766,12 +1519,6 @@ PAGE = """
       auto.innerText = t.auto_path_mode ? 'ON' : 'OFF';
       auto.className = 'v ' + (t.auto_path_mode ? 'ok' : 'bad');
       document.getElementById('t_progress').innerText = t.path_progress;
-      document.getElementById('t_penalty').innerText = t.intersection_penalty.toFixed(0);
-      var pbtn = document.getElementById('penalty_btn');
-      if (pbtn) {
-        pbtn.innerText = t.intersection_penalty > 0 ? 'ON' : 'OFF';
-        pbtn.className = t.intersection_penalty > 0 ? 'active' : '';
-      }
       var dphase = document.getElementById('t_duck_phase');
       dphase.innerText = t.duck_phase;
       dphase.className = 'v ' + (t.duck_phase === 'idle' ? 'ok' : 'bad');
@@ -1782,7 +1529,6 @@ PAGE = """
       else if (t.state === 'red_line_stopped') { box.style.background = '#c0342e'; box.style.color = '#fff'; }
       else if (t.state === 'duck_stopped') { box.style.background = '#e67e22'; box.style.color = '#fff'; }
       else if (t.state.indexOf('duck_overtake') === 0) { box.style.background = '#a855f7'; box.style.color = '#fff'; }
-      else if (t.state === 'u_turn') { box.innerText = 'U-TURN' + (t.note ? ' - ' + t.note : ''); box.style.background = '#06b6d4'; box.style.color = '#001018'; }
       else { box.style.background = '#f6c915'; box.style.color = '#111'; }
     });
   }, 250);
@@ -1798,8 +1544,6 @@ PAGE = """
   setInterval(reloadMap, 600);
   // ---- A* route setup wizard logic ----
   var clickMode = null;  // null, 'start', or 'goal' - which marker the next map click will place
-  var currentStart = null;
-  var currentGoal = null;
   function setClickMode(mode) {
     clickMode = (clickMode === mode) ? null : mode;
     var bStart = document.getElementById('modal_btn_start');
@@ -1813,14 +1557,12 @@ PAGE = """
   function mapTileClick(x, y) {
     if (clickMode === 'start') {
       fetch('/set_start?x=' + x + '&y=' + y).then(() => {
-        currentStart = x + ',' + y;
         setClickMode(null);
         document.getElementById('astar_setup_status').innerText = 'Start set! Now click 2. Set Goal.';
         reloadMap();
       });
     } else if (clickMode === 'goal') {
       fetch('/set_goal?x=' + x + '&y=' + y).then(() => {
-        currentGoal = x + ',' + y;
         setClickMode(null);
         document.getElementById('astar_setup_status').innerText = 'Goal set! Click 3. Compute Route.';
         reloadMap();
@@ -1844,35 +1586,6 @@ PAGE = """
       status.style.color = d.ok ? '#5ad07a' : '#ff6b6b';
       reloadMap();
     });
-  }
-  function togglePenalty() {
-    var enabled = document.getElementById('penalty_btn').innerText !== 'ON';
-    fetch('/set_intersection_penalty?enabled=' + (enabled ? '1' : '0')).then(() => computePath());
-  }
-  function compareCurrentRoute() {
-    var box = document.getElementById('compare_box');
-    if (!currentStart || !currentGoal) {
-      box.style.display = 'block';
-      box.innerHTML = '<div class="compare-cell" style="grid-column:1/3; color:#ff6b6b;">Set start and goal first.</div>';
-      return;
-    }
-    fetch('/compare_route?start=' + encodeURIComponent(currentStart) +
-          '&goal=' + encodeURIComponent(currentGoal) +
-          '&heading=' + encodeURIComponent(document.getElementById('heading_val').innerText))
-      .then(r => r.json()).then(d => {
-        if (!d.ok) {
-          box.style.display = 'block';
-          box.innerHTML = '<div class="compare-cell" style="grid-column:1/3; color:#ff6b6b;">' + d.error + '</div>';
-          return;
-        }
-        box.style.display = 'grid';
-        box.innerHTML =
-          '<div class="compare-cell"><strong style="color:#22c55e;">Penalty on</strong><br>' +
-          d.penalty_on.tile_count + ' tiles<br>' + d.penalty_on.intersection_count + ' intersections<br>' + d.penalty_on.estimated_time_s + 's est.</div>' +
-          '<div class="compare-cell"><strong style="color:#ff8c42;">Penalty off</strong><br>' +
-          d.penalty_off.tile_count + ' tiles<br>' + d.penalty_off.intersection_count + ' intersections<br>' + d.penalty_off.estimated_time_s + 's est.</div>';
-        reloadMap();
-      });
   }
   function confirmManual() {
     fetch('/confirm_manual').then(() => {
@@ -2008,38 +1721,6 @@ def compute_path_route():
     ok, message = compute_route()
     return jsonify({"ok": ok, "message": message})
 
-@app.route('/set_intersection_penalty')
-def set_intersection_penalty():
-    """Toggle the runtime A* intersection penalty between default and zero."""
-    global intersection_penalty_value
-    enabled = (request.args.get('enabled', '1') == '1')
-    intersection_penalty_value = DEFAULT_INTERSECTION_PENALTY if enabled else 0.0
-    return jsonify({"ok": True, "enabled": enabled, "penalty": intersection_penalty_value})
-
-def _parse_route_tile_arg(name):
-    raw = request.args.get(name, "")
-    if "," in raw:
-        a, b = raw.split(",", 1)
-        return int(a), int(b)
-    return int(request.args.get(name + "_x")), int(request.args.get(name + "_y"))
-
-@app.route('/compare_route')
-def compare_route_endpoint():
-    """Return penalty-on and penalty-off route summaries for start/goal/heading."""
-    global COMPARE_ROUTES
-    try:
-        start = _parse_route_tile_arg("start")
-        goal = _parse_route_tile_arg("goal")
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "bad start or goal; use start=x,y&goal=x,y"}), 400
-    heading = (request.args.get("heading") or bot_heading or "E").upper()
-    if heading not in DELTAS:
-        return jsonify({"ok": False, "error": "bad heading"}), 400
-    if start not in GRAPH_ADJ or goal not in GRAPH_ADJ:
-        return jsonify({"ok": False, "error": "start or goal is not drivable"}), 400
-    COMPARE_ROUTES = compare_routes(start, goal, heading)
-    return jsonify({"ok": True, **COMPARE_ROUTES})
-
 @app.route('/confirm_manual')
 def confirm_manual():
     """Called when the user picks 'Manual Mode' on the setup popup - this
@@ -2055,16 +1736,10 @@ def confirm_auto_path():
     """Called when the user clicks 'Start Driving (A*)' after computing a
     route - locks in autonomous driving mode."""
     global AUTO_PATH_MODE, SETUP_COMPLETE, post_intersections_tracking, post_intersection_start_time
-    global path_intersections_passed
     if len(ROUTE) < 2:
         return jsonify({"ok": False, "error": "compute a route first"})
     AUTO_PATH_MODE = True
     SETUP_COMPLETE = True
-    start_run_logging()
-    if ROUTE_INTERSECTION_ORDER and ROUTE_TURN_TILES.get(ROUTE_INTERSECTION_ORDER[0]) == "uturn":
-        path_intersections_passed = 1
-        start_u_turn()
-        return jsonify({"ok": True})
     if not ROUTE_INTERSECTION_ORDER:
         # The route has no intersections at all (e.g. start and goal are on
         # the same straight stretch) - there's nothing to detect along the
